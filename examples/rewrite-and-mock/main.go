@@ -6,13 +6,17 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
+	"encoding/json"
 	"math/big"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
+	"github.com/fsnotify/fsnotify"
 	"github.com/golang/groupcache/lru"
 	"github.com/lqqyt2423/go-mitmproxy/cert"
 	"github.com/lqqyt2423/go-mitmproxy/proxy"
@@ -20,40 +24,239 @@ import (
 	lua "github.com/yuin/gopher-lua"
 )
 
+// 全局变量，用于跟踪当前运行的代理实例
+var currentProxy *proxy.Proxy
+
+// Config 配置文件结构体
+type Config struct {
+	Addr              string `json:"addr"`
+	MockDir           string `json:"mock_dir"`
+	LuaScriptPath     string `json:"lua_script_path"`
+	CertPath          string `json:"cert_path"`
+	KeyPath           string `json:"key_path"`
+	StreamLargeBodies int    `json:"stream_large_bodies"`
+}
+
+// 默认配置
+var defaultConfig = Config{
+	Addr:              ":9080",
+	MockDir:           filepath.Join(os.TempDir(), "go-mitmproxy-mock"),
+	LuaScriptPath:     "rewrite_rules.lua",
+	CertPath:          filepath.Join("cert", "cert.pem"),
+	KeyPath:           filepath.Join("cert", "key.pem"),
+	StreamLargeBodies: 5 * 1024 * 1024, // 5MB
+}
+
+// 从文件加载配置
+func loadConfig(filename string) (*Config, error) {
+	config := defaultConfig
+
+	if filename == "" {
+		return &config, nil
+	}
+
+	data, err := os.ReadFile(filename)
+	if err != nil {
+		return nil, err
+	}
+
+	if err := json.Unmarshal(data, &config); err != nil {
+		return nil, err
+	}
+
+	return &config, nil
+}
+
 type RewriteAndMock struct {
 	proxy.BaseAddon
 	mockDir       string
 	luaScriptPath string
 	luaPool       sync.Pool
+	config        *Config
 }
 
 // 创建新的RewriteAndMock实例
-func NewRewriteAndMock(mockDir string, luaScriptPath string) *RewriteAndMock {
+func NewRewriteAndMock(config *Config) *RewriteAndMock {
 	// 确保mock目录存在
-	if _, err := os.Stat(mockDir); os.IsNotExist(err) {
-		os.MkdirAll(mockDir, 0755)
-		log.Infof("Created mock directory: %s", mockDir)
-	}
-
-	// 创建Lua解释器池
-	pool := sync.Pool{
-		New: func() interface{} {
-			L := lua.NewState()
-			// 为每个新创建的Lua解释器加载脚本
-			if luaScriptPath != "" {
-				if err := L.DoFile(luaScriptPath); err != nil {
-					log.Errorf("Failed to load Lua script: %v", err)
-				}
-			}
-			return L
-		},
+	if _, err := os.Stat(config.MockDir); os.IsNotExist(err) {
+		os.MkdirAll(config.MockDir, 0755)
+		log.Infof("Created mock directory: %s", config.MockDir)
 	}
 
 	return &RewriteAndMock{
-		mockDir:       mockDir,
-		luaScriptPath: luaScriptPath,
-		luaPool:       pool,
+		mockDir:       config.MockDir,
+		luaScriptPath: config.LuaScriptPath,
+		luaPool: sync.Pool{
+			New: func() interface{} {
+				L := lua.NewState()
+				// 为每个新创建的Lua解释器加载脚本
+				if config.LuaScriptPath != "" {
+					if err := L.DoFile(config.LuaScriptPath); err != nil {
+						log.Errorf("Failed to load Lua script: %v", err)
+					}
+				}
+				return L
+			},
+		},
+		config: config,
 	}
+}
+
+// 监听配置文件变化
+func watchConfigFile(configPath string, reloadFunc func()) error {
+	watcher, err := fsnotify.NewWatcher()
+	if err != nil {
+		return err
+	}
+
+	// 监控配置文件
+	if err := watcher.Add(configPath); err != nil {
+		watcher.Close()
+		return err
+	}
+
+	// 监控配置文件所在目录
+	configDir := filepath.Dir(configPath)
+	if err := watcher.Add(configDir); err != nil {
+		watcher.Close()
+		return err
+	}
+
+	go func() {
+		defer watcher.Close()
+
+		for {
+			select {
+			case event, ok := <-watcher.Events:
+				if !ok {
+					return
+				}
+
+				// 只处理配置文件的修改事件
+				if filepath.Clean(event.Name) == filepath.Clean(configPath) &&
+					(event.Op&fsnotify.Write == fsnotify.Write ||
+						event.Op&fsnotify.Create == fsnotify.Create) {
+					log.Infof("Config file changed: %s", event.Name)
+					reloadFunc()
+				}
+
+			case err, ok := <-watcher.Errors:
+				if !ok {
+					return
+				}
+				log.Errorf("Error watching config file: %v", err)
+			}
+		}
+	}()
+
+	return nil
+}
+
+// 监听Lua脚本变化
+func watchLuaScript(scriptPath string, reloadFunc func()) error {
+	if scriptPath == "" {
+		return nil
+	}
+
+	watcher, err := fsnotify.NewWatcher()
+	if err != nil {
+		return err
+	}
+
+	// 监控Lua脚本文件
+	if err := watcher.Add(scriptPath); err != nil {
+		watcher.Close()
+		return err
+	}
+
+	// 监控Lua脚本所在目录
+	scriptDir := filepath.Dir(scriptPath)
+	if err := watcher.Add(scriptDir); err != nil {
+		watcher.Close()
+		return err
+	}
+
+	go func() {
+		defer watcher.Close()
+
+		for {
+			select {
+			case event, ok := <-watcher.Events:
+				if !ok {
+					return
+				}
+
+				// 只处理Lua脚本文件的修改事件
+				if filepath.Clean(event.Name) == filepath.Clean(scriptPath) &&
+					(event.Op&fsnotify.Write == fsnotify.Write ||
+						event.Op&fsnotify.Create == fsnotify.Create) {
+					log.Infof("Lua script changed: %s", event.Name)
+					reloadFunc()
+				}
+
+			case err, ok := <-watcher.Errors:
+				if !ok {
+					return
+				}
+				log.Errorf("Error watching Lua script: %v", err)
+			}
+		}
+	}()
+
+	return nil
+}
+
+// 重启代理服务
+func restartProxy(configPath string) {
+	log.Info("Restarting proxy server...")
+
+	// 加载新配置
+	config, err := loadConfig(configPath)
+	if err != nil {
+		log.Errorf("Failed to load new config: %v", err)
+		return
+	}
+
+	// 创建新的代理实例
+	opts := &proxy.Options{
+		Addr:              config.Addr,
+		StreamLargeBodies: int64(config.StreamLargeBodies),
+		// 设置自定义CA函数
+		NewCaFunc: func() (cert.CA, error) {
+			return NewCustomCA(config.CertPath, config.KeyPath)
+		},
+	}
+
+	newProxy, err := proxy.NewProxy(opts)
+	if err != nil {
+		log.Errorf("Failed to create new proxy: %v", err)
+		return
+	}
+
+	// 添加addons
+	newProxy.AddAddon(NewRewriteAndMock(config))
+	newProxy.AddAddon(&proxy.LogAddon{})
+
+	// 关闭旧代理
+	if currentProxy != nil {
+		log.Info("Closing old proxy instance...")
+		if err := currentProxy.Close(); err != nil {
+			log.Errorf("Failed to close old proxy: %v", err)
+		} else {
+			log.Info("Old proxy instance closed successfully")
+		}
+	}
+
+	// 更新全局代理实例
+	currentProxy = newProxy
+
+	// 启动新代理
+	go func() {
+		log.Infof("Proxy server restarted on http://localhost%s", config.Addr)
+		if err := newProxy.Start(); err != nil {
+			log.Errorf("Proxy server error: %v", err)
+		}
+	}()
 }
 
 // ClientConnected 客户端连接时调用
@@ -109,34 +312,17 @@ func (a *RewriteAndMock) Requestheaders(f *proxy.Flow) {
 			// 如果返回值不为空，则更新请求
 			if newScheme != "" {
 				f.Request.URL.Scheme = newScheme
-				log.Infof("Lua script rewrote scheme to: %s", newScheme)
 			}
 			if newHost != "" {
 				f.Request.URL.Host = newHost
-				log.Infof("Lua script rewrote host to: %s", newHost)
 			}
 			if newPath != "" {
 				f.Request.URL.Path = newPath
-				log.Infof("Lua script rewrote path to: %s", newPath)
 			}
 			if newQuery != "" {
 				f.Request.URL.RawQuery = newQuery
-				log.Infof("Lua script rewrote query to: %s", newQuery)
 			}
 		}
-	}
-
-	// 3. 重写规则示例（仍然保留作为默认规则）
-	// 重写特定域名
-	if f.Request.URL.Host == "example.com" {
-		f.Request.URL.Host = "www.example.org"
-		log.Infof("Rewrote host from example.com to www.example.org")
-	}
-
-	// 重写特定路径
-	if strings.HasPrefix(f.Request.URL.Path, "/api/v1/") {
-		f.Request.URL.Path = strings.Replace(f.Request.URL.Path, "/api/v1/", "/api/v2/", 1)
-		log.Infof("Rewrote path to: %s", f.Request.URL.Path)
 	}
 
 	// 打印重写后的请求信息
@@ -158,7 +344,7 @@ func (a *RewriteAndMock) getMockFile(method, host, path string) string {
 	}
 
 	// 构建mock文件路径，格式：{mockDir}/{safeHost}/{method}_{safePath}.json
-	mockFile := filepath.Join(a.mockDir, safeHost, method+"_"+safePath+".json")
+	mockFile := filepath.Join(a.mockDir, safeHost, method+"_"+safePath)
 
 	// 检查文件是否存在
 	if _, err := os.Stat(mockFile); err == nil {
@@ -300,23 +486,23 @@ func main() {
 	// 设置日志级别
 	log.SetLevel(log.DebugLevel)
 
-	// 创建mock目录
-	mockDir := filepath.Join(os.TempDir(), "go-mitmproxy-mock")
+	// 配置文件路径（默认同目录下的config.json）
+	configPath := "config.json"
 
-	// Lua脚本路径（可以通过命令行参数或配置文件传递）
-	luaScriptPath := "rewrite_rules.lua"
-
-	// 证书文件路径
-	certPath := filepath.Join("cert", "cert.pem")
-	keyPath := filepath.Join("cert", "key.pem")
+	// 加载配置
+	config, err := loadConfig(configPath)
+	if err != nil {
+		log.Warnf("Failed to load config file %s, using default config: %v", configPath, err)
+		config = &defaultConfig
+	}
 
 	// 创建代理选项
 	opts := &proxy.Options{
-		Addr:              ":9080",
-		StreamLargeBodies: 1024 * 1024 * 5,
+		Addr:              config.Addr,
+		StreamLargeBodies: int64(config.StreamLargeBodies),
 		// 设置自定义CA函数
 		NewCaFunc: func() (cert.CA, error) {
-			return NewCustomCA(certPath, keyPath)
+			return NewCustomCA(config.CertPath, config.KeyPath)
 		},
 	}
 
@@ -326,18 +512,67 @@ func main() {
 		log.Fatal(err)
 	}
 
-	// 添加自定义addon，传入mock目录和Lua脚本路径
-	p.AddAddon(NewRewriteAndMock(mockDir, luaScriptPath))
-	// 添加日志addon
+	// 更新全局代理实例
+	currentProxy = p
+
+	// 添加addons
+	p.AddAddon(NewRewriteAndMock(config))
 	p.AddAddon(&proxy.LogAddon{})
 
-	log.Info("Proxy server starting on http://localhost:9080")
-	log.Infof("Mock directory: %s", mockDir)
-	log.Infof("Lua script path: %s", luaScriptPath)
-	log.Info("To use this proxy, configure your browser or application to use http://localhost:9080")
-	log.Info("Example mock file: ", filepath.Join(mockDir, "example_com", "GET_hello.json"))
+	log.Infof("Proxy server starting on http://localhost%s", config.Addr)
+	log.Infof("Mock directory: %s", config.MockDir)
+	log.Infof("Lua script path: %s", config.LuaScriptPath)
+	log.Infof("Config file: %s", configPath)
+	log.Info("To use this proxy, configure your browser or application to use http://localhost%s", config.Addr)
+	log.Info("Example mock file: ", filepath.Join(config.MockDir, "example_com", "GET_hello.json"))
 	log.Info("Example Lua script: rewrite_rules.lua should contain rewrite_request function")
+	log.Info("Example config file: config.json with addr, mock_dir, lua_script_path, cert_path, key_path fields")
 
 	// 启动代理
-	log.Fatal(p.Start())
+	go func() {
+		if err := p.Start(); err != nil {
+			log.Errorf("Proxy server error: %v", err)
+		}
+	}()
+
+	// 监听配置文件变化
+	if err := watchConfigFile(configPath, func() {
+		// 重启代理服务
+		restartProxy(configPath)
+	}); err != nil {
+		log.Warnf("Failed to watch config file: %v", err)
+	} else {
+		log.Infof("Watching config file: %s", configPath)
+	}
+
+	// 监听Lua脚本变化
+	if config.LuaScriptPath != "" {
+		if err := watchLuaScript(config.LuaScriptPath, func() {
+			// 重启代理服务
+			restartProxy(configPath)
+		}); err != nil {
+			log.Warnf("Failed to watch Lua script: %v", err)
+		} else {
+			log.Infof("Watching Lua script: %s", config.LuaScriptPath)
+		}
+	}
+
+	// 设置信号处理，确保程序退出时关闭代理实例
+	quit := make(chan os.Signal, 1)
+	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
+
+	// 等待退出信号
+	<-quit
+
+	// 关闭代理实例
+	if currentProxy != nil {
+		log.Info("Shutting down proxy server...")
+		if err := currentProxy.Close(); err != nil {
+			log.Errorf("Failed to close proxy: %v", err)
+		} else {
+			log.Info("Proxy server shut down successfully")
+		}
+	}
+
+	log.Info("Program exited")
 }

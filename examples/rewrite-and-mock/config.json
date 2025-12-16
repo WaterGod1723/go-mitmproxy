@@ -1,0 +1,8 @@
+{
+  "addr": ":9080",
+  "mock_dir": "mock",
+  "lua_script_path": "rewrite_rules.lua",
+  "cert_path": "cert/cert.pem",
+  "key_path": "cert/key.pem",
+  "stream_large_bodies": 5242880
+}
